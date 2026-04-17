@@ -1,0 +1,567 @@
+// ====================== 默认变量 ======================
+let sitename = "域名监控";
+let tgid = "";
+let tgtoken = "";
+let days = 7;
+
+// ====================== 发送 Telegram 消息 ======================
+async function sendtgMessage(message, tgid, tgtoken) {
+  if (!tgid || !tgtoken) return;
+  const url = `https://api.telegram.org/bot${tgtoken}/sendMessage`;
+  const params = { 
+    chat_id: tgid, 
+    text: message, 
+    parse_mode: "HTML" 
+  };
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    if (!res.ok) console.error('Telegram 发送失败:', await res.text());
+  } catch (error) {
+    console.error('Telegram 消息推送失败:', error);
+  }
+}
+
+export default {
+  async fetch(request, env) {
+    sitename = env.SITENAME || sitename;
+    tgid = env.TGID || tgid;
+    tgtoken = env.TGTOKEN || tgtoken;
+    days = parseInt(env.DAYS || days, 10) || 7;
+    const PASSWORD = env.PASSWORD || "";
+
+    const url = new URL(request.url);
+    let path = url.pathname;
+    if (path === '' || path === '/') path = '/';
+
+    // ====================== favicon 处理 ======================
+    if (path === '/favicon.ico') {
+      return new Response(null, { status: 204 });
+    }
+
+    // ====================== 密码保护（使用你提供的严格逻辑） ======================
+    if (PASSWORD) {
+      const cookieHeader = request.headers.get('cookie') || '';
+      const isAuthenticated = cookieHeader.includes(`domain_auth=${PASSWORD}`);
+
+      // 1. 处理登录提交
+      if (path === '/login' && request.method === 'POST') {
+        const formData = await request.formData();
+        if (formData.get('password') === PASSWORD) {
+          return new Response('', {
+            status: 302,
+            headers: {
+              'Set-Cookie': `domain_auth=${PASSWORD}; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Strict`,
+              'Location': '/',
+            },
+          });
+        } else {
+          // 密码错误，直接返回登录页并中断
+          return new Response(generateLoginHTML(sitename, true), {
+            headers: { 'Content-Type': 'text/html; charset=utf-8' },
+          });
+        }
+      }
+
+      // 2. 未登录则拦截一切请求
+      if (!isAuthenticated) {
+        if (path.startsWith('/api/')) {
+          return new Response(JSON.stringify({ success: false, message: '未授权访问' }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        // 普通页面请求返回登录页
+        return new Response(generateLoginHTML(sitename, false), {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
+      }
+    }
+
+    // ====================== API 接口 ======================
+    if (path === '/api/domains') {
+      if (request.method === 'GET') {
+        const data = await getDomainsData(env);
+        return new Response(JSON.stringify(data), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (request.method === 'POST') {
+        const body = await request.json();
+        const { action, index, domainData, newOrder } = body;
+
+        let domainsData = await getDomainsData(env);
+
+        if (action === 'reorder' && newOrder) {
+          const orderedData = newOrder.map(key => 
+            domainsData.find(item => item.domain === key)
+          ).filter(Boolean);
+          await saveDomainsData(env, orderedData);
+          return new Response(JSON.stringify({ success: true }));
+        }
+
+        if (action === 'save' || action === 'add') {
+          if (!domainData.domain || !domainData.system || !domainData.systemURL || 
+              !domainData.registrationDate || !domainData.expirationDate) {
+            return new Response(JSON.stringify({ success: false, message: '除特别说明外，所有字段不能为空' }), { status: 400 });
+          }
+          if (!isValidDate(domainData.registrationDate) || !isValidDate(domainData.expirationDate)) {
+            return new Response(JSON.stringify({ success: false, message: '注册时间和过期时间必须是有效日期格式 (YYYY-MM-DD)' }), { status: 400 });
+          }
+
+          if (action === 'add') {
+            domainsData.push(domainData);
+          } else if (action === 'save' && typeof index === 'number') {
+            domainsData[index] = domainData;
+          }
+        } else if (action === 'delete' && typeof index === 'number') {
+          domainsData.splice(index, 1);
+        } else {
+          return new Response(JSON.stringify({ success: false, message: '无效操作' }), { status: 400 });
+        }
+
+        await saveDomainsData(env, domainsData);
+        return new Response(JSON.stringify({ success: true }));
+      }
+    }
+
+    // ====================== 主页面 + TG 提醒 ======================
+    if (path === '/') {
+      const domainsData = await getDomainsData(env);
+      const today = new Date().toISOString().split('T')[0];
+
+      for (const domain of domainsData) {
+        const expirationDate = new Date(domain.expirationDate);
+        const daysRemaining = Math.ceil((expirationDate - Date.now()) / (1000 * 60 * 60 * 24));
+
+        if (daysRemaining > 0 && daysRemaining <= days) {
+          const message = `⚠️ <b>域名到期提醒</b>\n\n域名：${domain.domain}\n将在 <b>${daysRemaining}</b> 天后过期\n过期日期：${domain.expirationDate}`;
+          const lastSentDate = await env.DOMAINS_TG_KV?.get(domain.domain);
+
+          if (lastSentDate !== today) {
+            await sendtgMessage(message, tgid, tgtoken);
+            if (env.DOMAINS_TG_KV) await env.DOMAINS_TG_KV.put(domain.domain, today, { expirationTtl: 172800 });
+          }
+        }
+      }
+
+      const htmlContent = generateHTML(domainsData, sitename, !!PASSWORD);
+      return new Response(htmlContent, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
+    }
+
+    // ====================== 兜底：未知路径返回首页 ======================
+    const domainsData = await getDomainsData(env);
+    const htmlContent = generateHTML(domainsData, sitename, !!PASSWORD);
+    return new Response(htmlContent, {
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    });
+  }
+};
+
+// ====================== KV 操作 ======================
+async function getDomainsData(env) {
+  if (!env.DOMAINS_KV) return [];
+  const data = await env.DOMAINS_KV.get('domains', 'json');
+  return Array.isArray(data) ? data : [];
+}
+
+async function saveDomainsData(env, data) {
+  if (!env.DOMAINS_KV) throw new Error('DOMAINS_KV 未绑定');
+  await env.DOMAINS_KV.put('domains', JSON.stringify(data));
+}
+
+function isValidDate(dateStr) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return false;
+  const date = new Date(dateStr);
+  return date instanceof Date && !isNaN(date.getTime());
+}
+
+// ====================== 登录页面（优化版） ======================
+function generateLoginHTML(sitename, error = false) {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 - ${sitename}</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; background: linear-gradient(135deg, #f5f7fa, #e4e9f2); display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .login-box { background: white; padding: 40px 35px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.12); width: 360px; text-align: center; }
+    h2 { margin: 0 0 8px 0; color: #2c3e50; }
+    p { color: #555; margin-bottom: 25px; }
+    .error { color: #e74c3c; background: #fdf2f2; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; font-size: 15px; display: flex; align-items: center; gap: 8px; border-left: 4px solid #e74c3c; }
+    input { width: 100%; padding: 14px 16px; margin: 8px 0; border: 1px solid #ddd; border-radius: 8px; font-size: 16px; }
+    input:focus { outline: none; border-color: #3498db; box-shadow: 0 0 0 3px rgba(52,152,219,0.1); }
+    button { width: 100%; padding: 14px; background: #3498db; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: 600; margin-top: 10px; }
+    button:hover { background: #2980b9; }
+  </style>
+</head>
+<body>
+  <div class="login-box">
+    <h2>${sitename}</h2>
+    <p>请输入访问密码</p>
+    ${error ? `<div class="error">❌ 密码错误，请重试</div>` : ''}
+    <form method="POST" action="/login">
+      <input type="password" name="password" placeholder="输入密码" required autofocus>
+      <button type="submit">登录</button>
+    </form>
+  </div>
+</body>
+</html>`;
+}
+
+// ====================== 主页面 ======================
+function generateHTML(domainsData, SITENAME, hasPassword) {
+  const today = new Date();
+
+  const rowsHTML = domainsData.map((info, index) => {
+    const expDate = new Date(info.expirationDate);
+    const daysRemaining = Math.ceil((expDate - today) / (86400000));
+    const isExpired = today > expDate;
+
+    return `<tr data-index="${index}" data-domain="${info.domain || ''}" draggable="true">
+      <td class="drag-handle" style="display:none; width:40px; text-align:center; vertical-align:middle;">
+        <span style="cursor: grab; font-size: 22px; color: #64748b; user-select:none;">≡</span>
+      </td>
+      <td>
+        <span class="status-dot" style="background-color: ${isExpired ? '#e74c3c' : '#2ecc71'};" title="${isExpired ? '已过期' : '正常'}"></span>
+      </td>
+      <td class="domain-cell">
+        <span class="domain-name">${info.domain || ''}</span>
+        <span class="edit-icons" style="display:none;">
+          <span class="edit-icon" title="编辑">✏️</span>
+          <span class="delete-icon" title="删除">🗑️</span>
+        </span>
+      </td>
+      <td><a href="${info.systemURL || '#'}" target="_blank" rel="noopener">${info.system || ''}</a></td>
+      <td>${info.registrationDate || ''}</td>
+      <td>${info.expirationDate || ''}</td>
+      <td>${isExpired ? '<span style="color:#e74c3c">已过期</span>' : daysRemaining + ' 天'}</td>
+      <td class="note-cell">${info.note ? info.note.replace(/\n/g, '<br>') : '<span style="color:#999">无</span>'}</td>
+    </tr>`;
+  }).join('');
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${SITENAME}</title>
+  <link rel="icon" href="https://raw.githubusercontent.com/yutian81/yutian81.github.io/master/assets/images/domains.png" type="image/png">
+  <style>
+    :root { --primary: #3498db; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, Arial, sans-serif; margin:0; padding:0; background:#f8f9fa; color:#333; min-height:100vh; display:flex; flex-direction:column; }
+    .container { flex:1; width:95%; max-width:1280px; margin:20px auto; background:#fff; box-shadow:0 4px 20px rgba(0,0,0,0.1); border-radius:10px; overflow:hidden; }
+    h1 { background:linear-gradient(135deg, var(--primary), #2980b9); color:#fff; padding:20px 25px; margin:0; font-size:1.75rem; text-align:center; cursor:pointer; user-select:none; }
+    .table-container { overflow-x:auto; padding:0 10px; }
+    table { width:100%; border-collapse:collapse; min-width:1100px; }
+    th, td { padding:14px 10px; text-align:left; border-bottom:1px solid #eee; vertical-align: middle; }
+    th { background:#f8f9fa; font-weight:600; position:sticky; top:0; z-index:10; }
+    .drag-handle { width:40px; }
+    .status-dot { display:inline-block; width:13px; height:13px; border-radius:50%; margin-right:6px; }
+    .domain-cell { position:relative; min-width:180px; }
+    .domain-name { cursor:pointer; user-select:none; font-weight:500; }
+    .edit-icons { position:absolute; top:10px; right:12px; display:flex; gap:14px; font-size:20px; }
+    .edit-icon:hover { color:#1976d2; transform:scale(1.15); }
+    .delete-icon:hover { color:#d32f2f; transform:scale(1.15); }
+    .note-cell { max-width:420px; white-space:pre-wrap; word-break:break-all; line-height:1.5; }
+    .add-icon { font-size:26px; padding:14px 32px; background:#e8f5e9; color:#388e3c; border:2px dashed #4caf50; border-radius:10px; cursor:pointer; }
+    .add-icon:hover { background:#c8e6c9; }
+    tr { transition: all 0.2s; }
+    tr.dragging { opacity: 0.6; background: #f0f9ff; }
+    tr.over { border-top: 4px solid #3b82f6; }
+    .footer { text-align:center; padding:16px; background:var(--primary); color:#fff; font-size:0.92rem; }
+    .modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); align-items:center; justify-content:center; z-index:1000; }
+    .modal-content { background:white; border-radius:12px; width:92%; max-width:540px; max-height:92vh; overflow-y:auto; box-shadow:0 15px 35px rgba(0,0,0,0.25); }
+    .modal-header { padding:20px 24px; border-bottom:1px solid #eee; font-size:1.3rem; font-weight:600; }
+    .modal-body { padding:24px; }
+    .form-group { margin-bottom:18px; }
+    label { display:block; margin-bottom:6px; font-weight:500; color:#444; }
+    input, textarea { width:100%; padding:11px 12px; border:1px solid #ccc; border-radius:6px; font-size:1rem; }
+    textarea { resize:vertical; min-height:88px; }
+    .modal-footer { padding:18px 24px; border-top:1px solid #eee; display:flex; gap:12px; justify-content:flex-end; }
+    .btn { padding:11px 24px; border:none; border-radius:6px; cursor:pointer; font-size:1rem; }
+    .btn-cancel { background:#f1f1f1; color:#333; }
+    .btn-save { background:var(--primary); color:white; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1 ondblclick="toggleEditMode(this)">${SITENAME}</h1>
+    <div class="table-container">
+      <table id="domainsTable">
+        <thead>
+          <tr>
+            <th class="drag-th" style="width:40px; display:none;">排序</th>
+            <th>状态</th>
+            <th>域名</th>
+            <th>域名注册商</th>
+            <th>注册时间</th>
+            <th>过期时间</th>
+            <th>剩余天数</th>
+            <th>特别说明</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody">
+          ${rowsHTML}
+          <tr class="add-row">
+            <td colspan="8" style="text-align:center; padding:30px 10px;">
+              <span class="add-icon" id="addNewBtn" style="display:none;">➕ 添加新记录</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 编辑/添加模态框 -->
+  <div id="editModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header" id="modalTitle">编辑域名信息</div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>域名 <span style="color:#e74c3c">*</span></label>
+          <input type="text" id="editDomain" placeholder="example.com">
+        </div>
+        <div class="form-group">
+          <label>注册商名称 <span style="color:#e74c3c">*</span></label>
+          <input type="text" id="editSystem" placeholder="阿里云 / GoDaddy 等">
+        </div>
+        <div class="form-group">
+          <label>注册商网站地址 <span style="color:#e74c3c">*</span></label>
+          <input type="url" id="editSystemURL" placeholder="https://www.aliyun.com">
+        </div>
+        <div class="form-group">
+          <label>注册时间 <span style="color:#e74c3c">*</span></label>
+          <input type="date" id="editRegDate" max="9999-12-31">
+        </div>
+        <div class="form-group">
+          <label>过期时间 <span style="color:#e74c3c">*</span></label>
+          <input type="date" id="editExpDate" max="9999-12-31">
+        </div>
+        <div class="form-group">
+          <label>特别说明（可选，可换行）</label>
+          <textarea id="editNote" placeholder="此处填写特别说明、备注等..."></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-cancel" onclick="closeModal()">取消</button>
+        <button class="btn btn-save" onclick="saveItem()">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    Powered by Cloudflare Workers + KV | 双击标题进入/退出编辑模式（显示排序 ≡、编辑、删除）
+    ${hasPassword ? ' | 已启用密码保护' : ''}
+  </div>
+
+  <script>
+    let currentEditIndex = null;
+    let isEditMode = false;
+
+    function toggleEditMode(el) {
+      isEditMode = !isEditMode;
+      const displayValue = isEditMode ? '' : 'none';
+      document.querySelectorAll('.drag-th, .drag-handle').forEach(item => item.style.display = displayValue);
+      document.querySelectorAll('.edit-icons').forEach(icon => icon.style.display = isEditMode ? 'flex' : 'none');
+      const addBtn = document.getElementById('addNewBtn');
+      if (addBtn) addBtn.style.display = isEditMode ? 'inline-block' : 'none';
+      if (el) el.style.color = isEditMode ? '#f59e0b' : '#fff';
+    }
+
+    function openEditPanel(index = null) {
+      currentEditIndex = index;
+      const modal = document.getElementById('editModal');
+      const title = document.getElementById('modalTitle');
+
+      document.getElementById('editDomain').value = '';
+      document.getElementById('editSystem').value = '';
+      document.getElementById('editSystemURL').value = '';
+      document.getElementById('editRegDate').value = '';
+      document.getElementById('editExpDate').value = '';
+      document.getElementById('editNote').value = '';
+
+      if (index !== null) {
+        title.textContent = '编辑域名信息';
+        const row = document.querySelector('tr[data-index="' + index + '"]');
+        if (row) {
+          const cells = row.cells;
+          document.getElementById('editDomain').value = cells[2].querySelector('.domain-name').textContent.trim();
+          document.getElementById('editSystem').value = cells[3].textContent.trim();
+          const link = cells[3].querySelector('a');
+          document.getElementById('editSystemURL').value = link ? link.getAttribute('href') : '';
+          document.getElementById('editRegDate').value = cells[4].textContent.trim();
+          document.getElementById('editExpDate').value = cells[5].textContent.trim();
+          const noteCell = cells[7];
+          document.getElementById('editNote').value = (noteCell.textContent.trim() === '无') ? '' : noteCell.innerHTML.replace(/<br>/g, '\\n');
+        }
+      } else {
+        title.textContent = '添加新域名记录';
+      }
+      modal.style.display = 'flex';
+    }
+
+    function closeModal() {
+      document.getElementById('editModal').style.display = 'none';
+      currentEditIndex = null;
+    }
+
+    async function saveItem() {
+      const domainData = {
+        domain: document.getElementById('editDomain').value.trim(),
+        system: document.getElementById('editSystem').value.trim(),
+        systemURL: document.getElementById('editSystemURL').value.trim(),
+        registrationDate: document.getElementById('editRegDate').value,
+        expirationDate: document.getElementById('editExpDate').value,
+        note: document.getElementById('editNote').value.trim()
+      };
+
+      const action = currentEditIndex !== null ? 'save' : 'add';
+
+      try {
+        const res = await fetch('/api/domains', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action, index: currentEditIndex, domainData })
+        });
+        const result = await res.json();
+        if (result.success) location.reload();
+        else alert(result.message || '保存失败');
+      } catch (e) {
+        alert('网络错误，请重试');
+      }
+    }
+
+    async function deleteItem(index) {
+      if (!confirm('确定要删除这条域名记录吗？此操作不可恢复。')) return;
+      try {
+        const res = await fetch('/api/domains', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'delete', index })
+        });
+        const result = await res.json();
+        if (result.success) location.reload();
+      } catch (e) {
+        alert('网络错误');
+      }
+    }
+
+    // ====================== 拖拽排序 ======================
+    function initDragAndDrop() {
+      const tbody = document.getElementById('tableBody');
+      let draggedRow = null;
+
+      tbody.addEventListener('dragstart', (e) => {
+        if (!isEditMode) return;
+        draggedRow = e.target.closest('tr');
+        if (!draggedRow || draggedRow.classList.contains('add-row')) return;
+        e.dataTransfer.effectAllowed = 'move';
+        draggedRow.classList.add('dragging');
+      });
+
+      tbody.addEventListener('dragend', () => {
+        if (draggedRow) draggedRow.classList.remove('dragging');
+        document.querySelectorAll('tr').forEach(r => r.classList.remove('over'));
+      });
+
+      tbody.addEventListener('dragover', (e) => {
+        if (!isEditMode) return;
+        e.preventDefault();
+        const row = e.target.closest('tr');
+        if (row && !row.classList.contains('add-row')) row.classList.add('over');
+      });
+
+      tbody.addEventListener('dragleave', (e) => {
+        const row = e.target.closest('tr');
+        if (row) row.classList.remove('over');
+      });
+
+      tbody.addEventListener('drop', async (e) => {
+        if (!isEditMode) return;
+        e.preventDefault();
+        const targetRow = e.target.closest('tr');
+        if (!targetRow || !draggedRow || targetRow.classList.contains('add-row')) return;
+
+        const allRows = Array.from(tbody.querySelectorAll('tr:not(.add-row)'));
+        const fromIndex = allRows.indexOf(draggedRow);
+        const toIndex = allRows.indexOf(targetRow);
+
+        if (fromIndex === toIndex) return;
+
+        if (fromIndex < toIndex) targetRow.after(draggedRow);
+        else targetRow.before(draggedRow);
+
+        const newOrder = [];
+        document.querySelectorAll('tr[data-domain]').forEach(row => {
+          newOrder.push(row.dataset.domain);
+        });
+
+        try {
+          await fetch('/api/domains', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'reorder', newOrder })
+          });
+        } catch (err) {
+          console.error('保存排序失败', err);
+        }
+
+        draggedRow = null;
+      });
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      document.querySelectorAll('.edit-icon').forEach(icon => {
+        icon.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const row = e.target.closest('tr');
+          if (row) openEditPanel(parseInt(row.dataset.index));
+        });
+      });
+
+      document.querySelectorAll('.delete-icon').forEach(icon => {
+        icon.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const row = e.target.closest('tr');
+          if (row) deleteItem(parseInt(row.dataset.index));
+        });
+      });
+
+      document.querySelectorAll('.domain-name').forEach(name => {
+        name.addEventListener('dblclick', (e) => {
+          const row = e.target.closest('tr');
+          if (row) openEditPanel(parseInt(row.dataset.index));
+        });
+      });
+
+      const addBtn = document.getElementById('addNewBtn');
+      if (addBtn) addBtn.addEventListener('click', () => openEditPanel(null));
+
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+          const modal = document.getElementById('editModal');
+          if (modal.style.display === 'flex') closeModal();
+        }
+      });
+
+      initDragAndDrop();
+
+      document.querySelectorAll('.drag-th, .drag-handle, .edit-icons').forEach(el => {
+        el.style.display = 'none';
+      });
+      if (addBtn) addBtn.style.display = 'none';
+    });
+  </script>
+</body>
+</html>`;
+}
