@@ -1,3 +1,5 @@
+Workers1-3 | [workers-kv](README.domain.md) | [日本語](README.ja-JP.md)
+
 ## workers-1
 
 部署提醒在 Cloudflare 仪表盘创建 KV Namespace（名称随意）  
